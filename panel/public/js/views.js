@@ -151,9 +151,9 @@ function dashboardHtml() {
         '<div class="hero-orb">' + icon('box') + '</div>' +
         '<div class="hero-node-line"><span class="dot-live on"></span> panel ' + (state.online ? 'live' : 'offline') + ' · port ' + (sys ? sys.panel.port : 6868) + '</div>' +
         '<div class="hero-node-stats">' +
-          '<div><b>' + servers.length + '</b><span>servers</span></div>' +
-          '<div><b>' + running + '</b><span>running</span></div>' +
-          '<div><b>' + players + '</b><span>players</span></div>' +
+          '<div><b id="heroServers">' + servers.length + '</b><span>servers</span></div>' +
+          '<div><b id="heroRunning">' + running + '</b><span>running</span></div>' +
+          '<div><b id="heroPlayers">' + players + '</b><span>players</span></div>' +
         '</div>' +
       '</div>' +
     '</div>' +
@@ -689,6 +689,9 @@ function updateDashboardCounts() {
   const foot = $('#dashPlayersFoot');
   if (foot) foot.textContent = running ? 'across ' + running + ' live server' + (running === 1 ? '' : 's') : 'no servers online';
   setText('#navServerCount', String(servers.length));
+  setText('#heroServers', String(servers.length));
+  setText('#heroRunning', String(running));
+  setText('#heroPlayers', String(players));
 }
 
 function updateServerHeader() {

@@ -248,7 +248,7 @@ fetch_panel_source() {
     die "Could not extract the download."
   fi
   local found
-  found=$(find "$TMP_SRC" -maxdepth 2 -type f -name server.js -path '*/panel/*' | head -n1)
+  found=$(find "$TMP_SRC" -maxdepth 4 -type f -path '*/panel/server.js' | head -n1)
   if [ -z "$found" ]; then
     die "Downloaded archive does not look like BLUENODES."
   fi
