@@ -5,7 +5,7 @@ const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { EventEmitter } = require('events');
 const {
-  ensureDir, readJson, writeJson, safeJoin, findFreePort, slugify, randomId,
+  ensureDir, readJson, writeJson, safeJoin, isPortFree, slugify, randomId,
   formatBytes, stamp
 } = require('./util');
 const download = require('./download');
@@ -243,7 +243,14 @@ class Manager extends EventEmitter {
       const taken = Array.from(this.servers.values()).some((s) => s.port === spec.port);
       if (taken) throw new Error('Port ' + spec.port + ' is already used by another server on this panel');
     } else {
-      spec.port = await findFreePort(25565);
+      const used = new Set(Array.from(this.servers.values()).map((s) => s.port));
+      let candidate = 25565;
+      while (candidate <= PORT_MAX) {
+        if (!used.has(candidate) && await isPortFree(candidate)) break;
+        candidate++;
+      }
+      if (candidate > PORT_MAX) throw new Error('No free port found between 25565 and 65535');
+      spec.port = candidate;
     }
     const job = this.newJob('create');
     this.createServerJob(job, spec, opts || {}).catch(() => { /* emitted */ });
