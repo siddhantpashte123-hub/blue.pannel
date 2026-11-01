@@ -163,7 +163,11 @@ class MinecraftServer extends EventEmitter {
         this.exitCode = null;
         this.exitedAt = null;
         try {
-          fs.writeFileSync(path.join(this.dir, 'console.log'), '');
+          const logFile = path.join(this.dir, 'console.log');
+          if (fs.existsSync(logFile) && fs.statSync(logFile).size > 5 * 1024 * 1024) {
+            fs.renameSync(logFile, path.join(this.dir, 'console.log.old'));
+          }
+          fs.writeFileSync(logFile, '');
         } catch (err) { /* ignore */ }
 
         this.setStatus('starting');
