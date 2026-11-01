@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+# ============================================================
+#  BLUENODES — Minecraft hosting panel, one command
+#  made by blue
+#
+#  usage:
+#    curl -fsSL https://raw.githubusercontent.com/siddhantpashte123-hub/blue.pannel/main/cli/bluenodes -o /tmp/bluenodes && sudo bash /tmp/bluenodes
+#    sudo bluenodes              # interactive menu
+#    sudo bluenodes install      # install panel on port 6868
+#    sudo bluenodes uninstall    # stop and remove the panel
+#    sudo bluenodes status       # panel + java + servers
+#    sudo bluenodes install-java # install a headless JRE
+# ============================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+AUTHOR="blue"
+REPO="siddhantpashte123-hub/blue.pannel"
+BRANCH="${BLUENODES_BRANCH:-main}"
+PORT="${BLUENODES_PORT:-6868}"
+SERVICE="bluenodes"
+DEFAULT_DIR="/opt/bluenodes"
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  DEFAULT_DIR="${HOME}/.bluenodes"
+fi
+INSTALL_DIR="${BLUENODES_DIR:-$DEFAULT_DIR}"
+DATA_DIR="${BLUENODES_DATA:-$INSTALL_DIR/data}"
+STATE_DIR="$INSTALL_DIR/state"
+LOG_FILE="$STATE_DIR/panel.log"
+PID_FILE="$STATE_DIR/panel.pid"
+UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
+if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  BIN_DIR="${BLUENODES_BIN:-/usr/local/bin}"
+else
+  BIN_DIR="${BLUENODES_BIN:-$HOME/.local/bin}"
+fi
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+TARBALL_URL="https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
+
+# ---------------- colors / output ----------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'
+  C_BLUE=$'\033[38;5;39m'
+  C_BLUE2=$'\033[38;5;75m'
+  C_CYAN=$'\033[38;5;45m'
+  C_GREEN=$'\033[38;5;42m'
+  C_YELLOW=$'\033[38;5;214m'
+  C_RED=$'\033[38;5;203m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+else
+  C_RESET=""; C_BLUE=""; C_BLUE2=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_DIM=""; C_BOLD=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+err()  { printf '  %s✖%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+step() { printf '  %s▸%s %s\n' "$C_BLUE2" "$C_RESET" "$*"; }
+die()  { err "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------- banner ----------------
+ART='██████╗  ██╗      ██╗   ██╗ ███████╗ ███╗   ██╗  ██████╗  ██████╗  ███████╗ ███████╗
+██╔══██╗ ██║      ██║   ██║ ██╔════╝ ████╗  ██║ ██╔═══██╗ ██╔══██╗ ██╔════╝ ██╔════╝
+██████╔╝ ██║      ██║   ██║ █████╗   ██╔██╗ ██║ ██║   ██║ ██║  ██║ █████╗   ███████╗
+██╔══██╗ ██║      ██║   ██║ ██╔══╝   ██║╚██╗██║ ██║   ██║ ██║  ██║ ██╔══╝   ╚════██║
+██████╔╝ ███████╗ ╚██████╔╝ ███████╗ ██║ ╚████║ ╚██████╔╝ ██████╔╝ ███████╗ ███████║
+╚═════╝  ╚══════╝  ╚═════╝  ╚══════╝ ╚═╝  ╚═══╝  ╚═════╝  ╚═════╝  ╚══════╝ ╚══════╝'
+
+banner() {
+  local cols="${COLUMNS:-0}"
+  if [ "$cols" -eq 0 ] 2>/dev/null; then
+    cols=$(tput cols 2>/dev/null || echo 80)
+  fi
+  printf '\n'
+  if [ "${cols:-80}" -ge 90 ] 2>/dev/null; then
+    while IFS= read -r line; do
+      printf '%s%s%s\n' "$C_BLUE" "$line" "$C_RESET"
+    done <<< "$ART"
+  else
+    printf '%s╔══════════════════════════════════════╗%s\n' "$C_BLUE" "$C_RESET"
+    printf '%s║%s   %sB L U E N O D E S%s   %s·  port %s%s   %s║%s\n' \
+      "$C_BLUE" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$PORT" "$C_RESET" "$C_BLUE" "$C_RESET"
+    printf '%s╚══════════════════════════════════════╝%s\n' "$C_BLUE" "$C_RESET"
+  fi
+  printf '   %smade by %s%s%s%s   %s·%s   minecraft hosting panel   %s·%s   v%s%s\n\n' \
+    "$C_DIM" "$C_CYAN$C_BOLD" "$AUTHOR" "$C_RESET$C_DIM" "$C_RESET$C_DIM" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$VERSION" "$C_RESET"
+}
+
+hr() { printf '%s%s%s\n' "$C_DIM" "  ────────────────────────────────────────────────────────────" "$C_RESET"; }
+
+# ---------------- system helpers ----------------
+require_root() {
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    if have sudo; then
+      err "This action needs root. Re-run with: sudo bluenodes $*"
+    else
+      err "Run as root (or install sudo) to continue."
+    fi
+    exit 1
+  fi
+}
+
+has_systemd() {
+  [ -d /run/systemd/system ] && have systemctl && \
+    [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]
+}
+
+pkg_manager() {
+  for m in apt-get dnf yum apk pacman; do
+    if have "$m"; then echo "$m"; return; fi
+  done
+  echo ""
+}
+
+pkg_install() {
+  local mgr; mgr=$(pkg_manager)
+  case "$mgr" in
+    apt-get)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y >/dev/null 2>&1 || true
+      apt-get install -y "$@" >/dev/null 2>&1
+      ;;
+    dnf) dnf install -y "$@" >/dev/null 2>&1 ;;
+    yum) yum install -y "$@" >/dev/null 2>&1 ;;
+    apk) apk add --no-cache "$@" >/dev/null 2>&1 ;;
+    pacman) pacman -Sy --noconfirm "$@" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+node_major() {
+  if have node; then
+    node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1
+  else
+    echo 0
+  fi
+}
+
+ensure_node() {
+  local major; major=$(node_major)
+  if [ "${major:-0}" -ge 16 ] 2>/dev/null; then
+    ok "Node.js $(node -v) found"
+    return 0
+  fi
+  step "Node.js 18+ not found — installing it (this can take a minute)"
+  require_root "install node.js"
+  local mgr; mgr=$(pkg_manager)
+  case "$mgr" in
+    apt-get)
+      if have curl; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
+      fi
+      apt-get install -y nodejs >/dev/null 2>&1 || pkg_install nodejs npm
+      ;;
+    dnf|yum)
+      curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
+      pkg_install nodejs
+      ;;
+    apk) pkg_install nodejs npm ;;
+    pacman) pkg_install nodejs npm ;;
+    *) : ;;
+  esac
+  major=$(node_major)
+  if [ "${major:-0}" -lt 16 ] 2>/dev/null; then
+    step "Trying the official Node.js tarball"
+    local arch ver tmpdir
+    arch=$(uname -m)
+    [ "$arch" = "aarch64" ] && arch="arm64" || arch="x64"
+    ver="v20.18.1"
+    tmpdir=$(mktemp -d)
+    if curl -fsSL "https://nodejs.org/dist/${ver}/node-${ver}-linux-${arch}.tar.xz" -o "$tmpdir/node.tar.xz"; then
+      mkdir -p /usr/local/lib/nodejs
+      tar -xJf "$tmpdir/node.tar.xz" -C /usr/local/lib/nodejs 2>/dev/null
+      ln -sf "/usr/local/lib/nodejs/node-${ver}-linux-${arch}/bin/node" /usr/local/bin/node
+      ln -sf "/usr/local/lib/nodejs/node-${ver}-linux-${arch}/bin/npm" /usr/local/bin/npm
+      rm -rf "$tmpdir"
+    else
+      rm -rf "$tmpdir"
+    fi
+  fi
+  major=$(node_major)
+  if [ "${major:-0}" -lt 16 ] 2>/dev/null; then
+    die "Could not install Node.js 18+. Install it manually (https://nodejs.org) and run this again."
+  fi
+  ok "Node.js $(node -v) installed"
+}
+
+node_bin() {
+  local p
+  p=$(command -v node 2>/dev/null || true)
+  if [ -z "$p" ] && [ -x /usr/local/bin/node ]; then p=/usr/local/bin/node; fi
+  echo "${p:-node}"
+}
+
+ensure_curl() {
+  if have curl || have wget; then return 0; fi
+  require_root "install curl"
+  pkg_install curl || die "curl is required"
+}
+
+download() {
+  local url="$1" dest="$2"
+  if have curl; then
+    curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$dest"
+  elif have wget; then
+    wget -qO "$dest" "$url"
+  else
+    return 1
+  fi
+}
+
+fetch_text() {
+  if have curl; then
+    curl -fsSL --connect-timeout 15 "$1"
+  elif have wget; then
+    wget -qO- "$1"
+  fi
+}
+
+# ---------------- source of the panel ----------------
+REPO_ROOT=""
+if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/../panel/server.js" ]; then
+  REPO_ROOT="$(cd "$SELF_DIR/.." && pwd)"
+fi
+
+TMP_SRC=""
+cleanup_tmp() { [ -n "$TMP_SRC" ] && rm -rf "$TMP_SRC"; }
+trap cleanup_tmp EXIT
+
+fetch_panel_source() {
+  if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/panel/server.js" ]; then
+    SRC_DIR="$REPO_ROOT"
+    return 0
+  fi
+  step "Downloading BLUENODES from GitHub"
+  ensure_curl
+  TMP_SRC=$(mktemp -d)
+  local archive="$TMP_SRC/bluenodes.tar.gz"
+  if ! download "$TARBALL_URL" "$archive"; then
+    die "Could not download ${REPO} (${BRANCH}). Check your internet connection."
+  fi
+  if ! tar -xzf "$archive" -C "$TMP_SRC" 2>/dev/null; then
+    die "Could not extract the download."
+  fi
+  local found
+  found=$(find "$TMP_SRC" -maxdepth 2 -type f -name server.js -path '*/panel/*' | head -n1)
+  if [ -z "$found" ]; then
+    die "Downloaded archive does not look like BLUENODES."
+  fi
+  SRC_DIR=$(cd "$(dirname "$found")/.." && pwd)
+}
+
+copy_panel() {
+  fetch_panel_source
+  mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$STATE_DIR"
+  step "Installing panel files to $INSTALL_DIR"
+  if ! (cd "$SRC_DIR/panel" && tar cf - --exclude=node_modules --exclude=data --exclude=state .) | (cd "$INSTALL_DIR" && tar xf -); then
+    die "Could not copy panel files"
+  fi
+  if ! grep -q "BLUENODES" "$INSTALL_DIR/server.js" 2>/dev/null; then
+    die "Installed files do not look right — aborting"
+  fi
+  if [ -n "$BRANCH" ] && [ -d "$SRC_DIR/.git" ]; then
+    git -C "$SRC_DIR" rev-parse --short HEAD > "$STATE_DIR/version.txt" 2>/dev/null || true
+  fi
+  printf '%s\n' "$VERSION" > "$STATE_DIR/cli-version.txt"
+}
+
+install_cli() {
+  local target="$BIN_DIR/bluenodes"
+  if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bluenodes" ]; then
+    install -d "$BIN_DIR" 2>/dev/null || true
+    install -m 755 "$SELF_DIR/bluenodes" "$target" 2>/dev/null || cp "$SELF_DIR/bluenodes" "$target"
+  elif ! [ -s "$target" ]; then
+    fetch_text "$RAW_BASE/cli/bluenodes" > "$target" 2>/dev/null || true
+    chmod 755 "$target" 2>/dev/null || true
+  fi
+  if [ -f "$target" ]; then
+    chmod 755 "$target" 2>/dev/null || true
+    ok "CLI installed: $target"
+    case ":$PATH:" in
+      *":$BIN_DIR:"*) : ;;
+      *) warn "Add $BIN_DIR to your PATH to use the 'bluenodes' command everywhere." ;;
+    esac
+  fi
+}
+
+# ---------------- service management ----------------
+write_unit() {
+  cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=BLUENODES Minecraft hosting panel (made by blue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+Environment=BLUENODES_HOME=$DATA_DIR
+Environment=BLUENODES_PORT=$PORT
+Environment=BLUENODES_HOST=0.0.0.0
+Environment=NODE_ENV=production
+ExecStart=$(node_bin) $INSTALL_DIR/server.js
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+panel_healthy() {
+  have curl || return 1
+  curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1
+}
+
+start_panel() {
+  if panel_healthy; then
+    ok "Panel already running on port $PORT"
+    return 0
+  fi
+  if has_systemd && [ -f "$UNIT_FILE" ]; then
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE" >/dev/null 2>&1 || systemctl start "$SERVICE" >/dev/null 2>&1
+  else
+    mkdir -p "$STATE_DIR"
+    (
+      cd "$INSTALL_DIR" || exit 1
+      export BLUENODES_HOME="$DATA_DIR" BLUENODES_PORT="$PORT" BLUENODES_HOST=0.0.0.0
+      exec nohup "$(node_bin)" "$INSTALL_DIR/server.js"
+    ) < /dev/null >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+  fi
+  local i
+  for i in $(seq 1 40); do
+    if panel_healthy; then
+      ok "Panel responding on port $PORT"
+      return 0
+    fi
+    sleep 0.5
+  done
+  err "Panel did not answer on port $PORT."
+  if has_systemd && [ -f "$UNIT_FILE" ]; then
+    say "  Check the logs: journalctl -u $SERVICE -n 50 --no-pager"
+  else
+    say "  Check the logs: tail -n 50 $LOG_FILE"
+  fi
+  return 1
+}
+
+stop_panel() {
+  if has_systemd && [ -f "$UNIT_FILE" ]; then
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$PID_FILE" ]; then
+    local pid; pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+  fi
+  # also catch a panel started manually out of the install dir
+  pkill -f "$INSTALL_DIR/server.js" 2>/dev/null || true
+  local i
+  for i in $(seq 1 24); do
+    panel_healthy || break
+    sleep 0.5
+  done
+  if panel_healthy; then
+    warn "Panel still answering on port ${PORT} — it may be managed elsewhere"
+  else
+    ok "Panel stopped"
+  fi
+}
+
+restart_panel() {
+  stop_panel >/dev/null 2>&1 || true
+  sleep 1
+  start_panel
+}
+
+panel_running() {
+  if has_systemd && [ -f "$UNIT_FILE" ] && systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+    return 0
+  fi
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  panel_healthy
+}
+
+local_ip() {
+  local ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  if [ -z "$ip" ]; then
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
+  fi
+  echo "${ip:-localhost}"
+}
+
+# ---------------- install ----------------
+do_install() {
+  banner
+  printf '  %sINSTALL%s  panel on port %s%s%s\n' "$C_BOLD" "$C_RESET" "$C_CYAN" "$PORT" "$C_RESET"
+  hr
+  ensure_curl
+  ensure_node
+  copy_panel
+  install_cli
+
+  if has_systemd && [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    step "Installing systemd service ($SERVICE)"
+    write_unit
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+  else
+    step "Starting panel in the background (no systemd)"
+    if [ -f "$PID_FILE" ]; then
+      local old; old=$(cat "$PID_FILE" 2>/dev/null || true)
+      [ -n "$old" ] && kill "$old" 2>/dev/null || true
+      rm -f "$PID_FILE"
+    fi
+    mkdir -p "$STATE_DIR"
+    (
+      cd "$INSTALL_DIR" || exit 1
+      export BLUENODES_HOME="$DATA_DIR" BLUENODES_PORT="$PORT" BLUENODES_HOST=0.0.0.0
+      exec nohup "$(node_bin)" "$INSTALL_DIR/server.js"
+    ) < /dev/null >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+  fi
+
+  local i
+  for i in $(seq 1 40); do panel_healthy && break; sleep 0.5; done
+
+  hr
+  if panel_healthy; then
+    ok "BLUENODES is installed and running"
+  else
+    warn "Panel is installed but not responding yet — check: bluenodes logs"
+  fi
+  say ""
+  say "   ${C_BOLD}panel${C_RESET}    ${C_CYAN}http://$(local_ip):${PORT}${C_RESET}"
+  say "   ${C_BOLD}port${C_RESET}     ${PORT}   ${C_DIM}(open it in your firewall / cloud security group)${C_RESET}"
+  say "   ${C_BOLD}data${C_RESET}     ${DATA_DIR}"
+  say "   ${C_BOLD}menu${C_RESET}     sudo bluenodes"
+  say ""
+  if ! have java; then
+    warn "Java is not installed — servers cannot start yet."
+    say "   ${C_DIM}install it with:${C_RESET} sudo bluenodes install-java"
+  else
+    ok "Java detected ($(java -version 2>&1 | head -n1 | sed 's/.*version //; s/"//g'))"
+  fi
+  say ""
+  say "   ${C_DIM}Minecraft clients connect to  <your-ip>:<server-port>, not to the panel port.${C_RESET}"
+  hr
+  say ""
+}
+
+# ---------------- uninstall ----------------
+do_uninstall() {
+  local purge="no" assume="no"
+  for arg in "$@"; do
+    case "$arg" in
+      --purge|-p) purge="yes" ;;
+      --yes|-y) assume="yes" ;;
+    esac
+  done
+  banner
+  printf '  %sUNINSTALL%s  %s\n' "$C_BOLD" "$C_RESET" "$INSTALL_DIR"
+  hr
+  if [ ! -f "$INSTALL_DIR/server.js" ] && ! panel_running; then
+    warn "BLUENODES does not look installed here."
+    say "  ${C_DIM}Nothing to remove.${C_RESET}"
+    return 0
+  fi
+  if [ "$assume" != "yes" ]; then
+    printf '  Remove the panel from this server? [y/N] '
+    read -r reply || reply="n"
+    case "$reply" in y|Y|yes|YES) : ;; *) say "  cancelled"; return 0 ;; esac
+  fi
+
+  stop_panel
+  if has_systemd && [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "$UNIT_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "systemd service removed"
+  fi
+
+  if [ "$purge" != "yes" ] && [ "$assume" != "yes" ] && [ -d "$DATA_DIR" ]; then
+    printf '  Also delete all Minecraft servers + data in %s? [y/N] ' "$DATA_DIR"
+    read -r reply || reply="n"
+    case "$reply" in y|Y|yes|YES) purge="yes" ;; *) purge="no" ;; esac
+  fi
+
+  if [ "$purge" = "yes" ]; then
+    rm -rf "$INSTALL_DIR"
+    ok "Panel + data removed"
+  else
+    # keep data, remove the app files only
+    find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data ! -name state -exec rm -rf {} + 2>/dev/null || true
+    rm -rf "$INSTALL_DIR/public" "$INSTALL_DIR/lib" 2>/dev/null || true
+    ok "Panel removed — server data kept in $DATA_DIR"
+  fi
+
+  local bin="$BIN_DIR/bluenodes"
+  [ -f "$bin" ] && rm -f "$bin" && ok "CLI removed ($bin)"
+  say ""
+  say "   ${C_DIM}Thanks for trying BLUENODES — made by ${AUTHOR}${C_RESET}"
+  say ""
+}
+
+# ---------------- status ----------------
+json_field() {
+  # json_field '<json>' 'a.b.c'
+  printf '%s' "$1" | node -e '
+let d="";
+process.stdin.on("data",c=>d+=c);
+process.stdin.on("end",()=>{
+  try{
+    const path=process.argv[1].split(".");
+    let o=JSON.parse(d);
+    for(const k of path){ o = o==null?undefined:o[k]; }
+    process.stdout.write(o===undefined||o===null?"":String(o));
+  }catch(e){}
+});' "$2" 2>/dev/null
+}
+
+do_status() {
+  banner
+  printf '  %sSTATUS%s\n' "$C_BOLD" "$C_RESET"
+  hr
+  local state="stopped"
+  if has_systemd && [ -f "$UNIT_FILE" ] && systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+    state="running (systemd)"
+  elif panel_running; then
+    state="running (background)"
+  fi
+
+  local health=""
+  if have curl; then health=$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || true); fi
+  if [ -n "$health" ]; then
+    printf '  %s%-10s%s %s\n' "$C_DIM" "state" "$C_RESET" "${C_GREEN}${state}${C_RESET}"
+  else
+    printf '  %s%-10s%s %s\n' "$C_DIM" "state" "$C_RESET" "${C_RED}${state} (not responding)${C_RESET}"
+  fi
+  printf '  %s%-10s%s %s\n' "$C_DIM" "url" "$C_RESET" "${C_CYAN}http://$(local_ip):${PORT}${C_RESET}"
+  printf '  %s%-10s%s %s\n' "$C_DIM" "install" "$C_RESET" "${INSTALL_DIR:-—}"
+  printf '  %s%-10s%s %s\n' "$C_DIM" "data" "$C_RESET" "${DATA_DIR:-—}"
+
+  if have node; then
+    printf '  %s%-10s%s %s\n' "$C_DIM" "node" "$C_RESET" "$(node -v 2>/dev/null)"
+  fi
+  if have java; then
+    local jver; jver=$(java -version 2>&1 | head -n1 | sed 's/.*version //; s/"//g')
+    printf '  %s%-10s%s %s\n' "$C_DIM" "java" "$C_RESET" "${C_GREEN}${jver}${C_RESET}"
+  else
+    printf '  %s%-10s%s %s\n' "$C_DIM" "java" "$C_RESET" "${C_YELLOW}not installed — run: sudo bluenodes install-java${C_RESET}"
+  fi
+
+  if [ -z "$health" ]; then
+    hr
+    warn "Panel is not answering on port $PORT — start it with: sudo bluenodes start"
+    say ""
+    return 1
+  fi
+
+  local sys servers
+  sys=$(curl -fsS --max-time 4 "http://127.0.0.1:${PORT}/api/system" 2>/dev/null || true)
+  servers=$(curl -fsS --max-time 4 "http://127.0.0.1:${PORT}/api/servers" 2>/dev/null || true)
+
+  if [ -n "$sys" ]; then
+    printf '  %s%-10s%s %s\n' "$C_DIM" "panel" "$C_RESET" "v$(json_field "$sys" data.panel.version) · pid $(json_field "$sys" data.panel.pid) · up $(json_field "$sys" data.panel.uptime)s"
+    printf '  %s%-10s%s %s\n' "$C_DIM" "host" "$C_RESET" "$(json_field "$sys" data.host.hostname) · $(json_field "$sys" data.host.cpus) cores · $(json_field "$sys" data.host.cpuModel)"
+    printf '  %s%-10s%s %s\n' "$C_DIM" "cpu" "$C_RESET" "$(json_field "$sys" data.cpu.percent)%"
+    printf '  %s%-10s%s %s\n' "$C_DIM" "memory" "$C_RESET" "$(json_field "$sys" data.memory.usedText) / $(json_field "$sys" data.memory.totalText) ($(json_field "$sys" data.memory.percent)%)"
+    printf '  %s%-10s%s %s\n' "$C_DIM" "disk" "$C_RESET" "$(json_field "$sys" data.disk.usedText) / $(json_field "$sys" data.disk.totalText) ($(json_field "$sys" data.disk.percent)%)"
+  fi
+
+  hr
+  if [ -n "$servers" ] && have node; then
+    printf '%s' "$servers" | BLUENODES_STATUS_PORT="$PORT" node -e '
+let d="";
+process.stdin.on("data",c=>d+=c);
+process.stdin.on("end",()=>{
+  let list=[];
+  try{ list=JSON.parse(d).data.servers||[]; }catch(e){}
+  const port=process.env.BLUENODES_STATUS_PORT||"6868";
+  if(!list.length){
+    console.log("  no servers yet — open the panel and create one: http://<your-ip>:" + port);
+    return;
+  }
+  const pad=(s,n)=>{s=String(s);return s.length>=n?s.slice(0,n):s+" ".repeat(n-s.length);};
+  console.log("  " + pad("NAME",20) + pad("STATUS",10) + pad("PORT",7) + pad("PLAYERS",9) + "SOFTWARE");
+  console.log("  " + "-".repeat(64));
+  for(const s of list){
+    const colour = s.status==="running" ? "\x1b[38;5;42m" : "\x1b[2m";
+    console.log("  " + pad(s.name,20) + colour + pad(s.status,10) + "\x1b[0m" + pad(s.port,7) + pad((s.players||[]).length,9) + s.type + " " + s.version);
+  }
+  const running=list.filter(s=>s.status==="running").length;
+  console.log("");
+  console.log("  " + list.length + " server(s), " + running + " running");
+});' 2>/dev/null
+  fi
+  say ""
+}
+
+# ---------------- java ----------------
+java_major() {
+  if ! have java; then echo 0; return; fi
+  java -version 2>&1 | head -n1 | sed -E 's/.*version "([0-9]+).*/\1/; s/.*version "1\.([0-9]+).*/\1/' | head -n1
+}
+
+do_install_java() {
+  local want="${1:-21}"
+  banner
+  printf '  %sINSTALL JAVA%s  openjdk-%s (headless)\n' "$C_BOLD" "$C_RESET" "$want"
+  hr
+  if have java; then
+    local cur; cur=$(java_major)
+    step "Java already installed: $(java -version 2>&1 | head -n1 | sed 's/.*version //; s/"//g')"
+    if [ "${cur:-0}" -ge "$want" ] 2>/dev/null; then
+      ok "Java ${cur} is new enough for modern Minecraft"
+      say "  ${C_DIM}Nothing to do. Use --force to reinstall.${C_RESET}"
+      [ "${2:-}" = "--force" ] || return 0
+    fi
+  fi
+  require_root "install-java"
+  local mgr; mgr=$(pkg_manager)
+  step "Installing OpenJDK ${want}"
+  case "$mgr" in
+    apt-get)
+      if ! pkg_install "openjdk-${want}-jre-headless"; then
+        warn "openjdk-${want} not in this distro — trying 17"
+        pkg_install openjdk-17-jre-headless || die "Could not install Java via apt."
+      fi
+      ;;
+    dnf|yum)
+      pkg_install "java-${want}-openjdk-headless" || pkg_install "java-17-openjdk-headless" || die "Could not install Java."
+      ;;
+    apk) pkg_install "openjdk${want}" "openjdk${want}-jre-headless" || pkg_install openjdk17 || die "Could not install Java." ;;
+    pacman) pkg_install "jre${want}-openjdk-headless" || pkg_install jre17-openjdk-headless || die "Could not install Java." ;;
+    *) die "Unknown package manager — install Java ${want} manually." ;;
+  esac
+  if have java; then
+    ok "Java installed: $(java -version 2>&1 | head -n1 | sed 's/.*version //; s/"//g')"
+  else
+    warn "Java command not found after install — check your distribution packages."
+  fi
+  say ""
+}
+
+# ---------------- update / logs ----------------
+do_update() {
+  banner
+  printf '  %sUPDATE%s\n' "$C_BOLD" "$C_RESET"
+  hr
+  if ! [ -f "$INSTALL_DIR/server.js" ]; then
+    die "BLUENODES is not installed in $INSTALL_DIR"
+  fi
+  copy_panel
+  install_cli
+  restart_panel
+  say ""
+  ok "Updated to the latest ${BRANCH} build"
+  say "  ${C_DIM}panel: http://$(local_ip):${PORT}${C_RESET}"
+  say ""
+}
+
+do_logs() {
+  if has_systemd && [ -f "$UNIT_FILE" ] && systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+    say "${C_DIM}journalctl -u ${SERVICE} -f  (ctrl+c to exit)${C_RESET}"
+    journalctl -u "$SERVICE" -n 120 -f --no-pager
+  elif [ -f "$LOG_FILE" ]; then
+    say "${C_DIM}tail -f ${LOG_FILE}  (ctrl+c to exit)${C_RESET}"
+    tail -n 120 -f "$LOG_FILE"
+  else
+    warn "No logs yet — is the panel installed and started?"
+  fi
+}
+
+# ---------------- menu ----------------
+menu() {
+  while true; do
+    banner
+    printf '   %s1%s  INSTALL      %sinstall panel on port %s%s\n'  "$C_BOLD$C_CYAN" "$C_RESET" "$C_DIM" "$PORT" "$C_RESET"
+    printf '   %s2%s  UNINSTALL    %sstop and remove the panel%s\n'               "$C_BOLD$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s3%s  STATUS       %spanel, java and servers%s\n'                "$C_BOLD$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s4%s  START        %sstart the panel%s\n'                         "$C_BOLD$C_BLUE2" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s5%s  STOP         %sstop the panel%s\n'                          "$C_BOLD$C_BLUE2" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s6%s  RESTART      %srestart the panel%s\n'                       "$C_BOLD$C_BLUE2" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s7%s  LOGS         %sfollow panel logs%s\n'                       "$C_BOLD$C_BLUE2" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s8%s  UPDATE       %sdownload the latest version%s\n'             "$C_BOLD$C_BLUE2" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s9%s  INSTALL JAVA %sinstall openjdk for minecraft%s\n'           "$C_BOLD$C_BLUE2" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s0%s  EXIT\n'                                                     "$C_BOLD$C_BLUE2" "$C_RESET"
+    printf '\n   %sBLUENODES · made by blue · port %s%s\n\n' "$C_DIM" "$PORT" "$C_RESET"
+
+    if [ ! -t 0 ]; then
+      say "  ${C_DIM}non-interactive shell — use: bluenodes install|uninstall|status|start|stop|logs${C_RESET}"
+      return 0
+    fi
+    printf '   %schoose an option ›%s ' "$C_CYAN" "$C_RESET"
+    local choice=""
+    read -r choice || return 0
+    case "$choice" in
+      1|install|INSTALL) do_install ;;
+      2|uninstall|UNINSTALL) do_uninstall ;;
+      3|status|STATUS) do_status ;;
+      4|start|START) banner; start_panel; say "" ;;
+      5|stop|STOP) banner; stop_panel; say "" ;;
+      6|restart|RESTART) banner; restart_panel; say "" ;;
+      7|logs|LOGS) do_logs; return 0 ;;
+      8|update|UPDATE) do_update ;;
+      9|java|install-java|JAVA) do_install_java ;;
+      0|q|quit|exit|EXIT) say ""; say "  ${C_DIM}bye — made by blue${C_RESET}"; say ""; return 0 ;;
+      "") : ;;
+      *) warn "Unknown option: $choice" ;;
+    esac
+    if [ -t 0 ]; then
+      printf '\n  %spress enter to return to the menu%s' "$C_DIM" "$C_RESET"
+      read -r _ || true
+    fi
+  done
+}
+
+help_text() {
+  cat <<EOF
+
+BLUENODES v${VERSION} — Minecraft hosting panel, made by ${AUTHOR}
+
+usage: bluenodes [command]
+
+commands:
+  install          install the panel + service, start on port ${PORT}
+  uninstall        stop and remove the panel  (--purge deletes server data)
+  status           panel, java and server overview
+  start            start the panel
+  stop             stop the panel
+  restart          restart the panel
+  logs             follow panel logs
+  update           update to the latest version and restart
+  install-java     install a headless OpenJDK (default 21)
+  menu             open the interactive menu (default)
+
+one command install:
+  curl -fsSL ${RAW_BASE}/cli/bluenodes -o /tmp/bluenodes && sudo bash /tmp/bluenodes
+
+env:
+  BLUENODES_PORT   panel port (default 6868)
+  BLUENODES_DIR    install directory (default /opt/bluenodes)
+  BLUENODES_DATA   data directory (default \$BLUENODES_DIR/data)
+
+EOF
+}
+
+main() {
+  local cmd="${1:-menu}"
+  case "$cmd" in
+    menu) menu ;;
+    install) do_install ;;
+    uninstall|remove) shift || true; do_uninstall "$@" ;;
+    status) do_status ;;
+    start) banner; start_panel; say "" ;;
+    stop) banner; stop_panel; say "" ;;
+    restart) banner; restart_panel; say "" ;;
+    logs) do_logs ;;
+    update) do_update ;;
+    install-java|java) shift || true; do_install_java "${1:-21}" "${2:-}" ;;
+    version|-v|--version) echo "BLUENODES v${VERSION} — made by ${AUTHOR}" ;;
+    help|-h|--help) help_text ;;
+    *) err "unknown command: $cmd"; help_text; exit 1 ;;
+  esac
+}
+
+main "$@"
